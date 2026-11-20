@@ -49,7 +49,7 @@ int main() {
     def test_mqtt_publishes_versioned_full_snapshot_with_heartbeat(self):
         source = (ROOT / 'WifiMqttTransport.cpp').read_text()
         self.assertIn('constexpr uint32_t kPublishIntervalMs = 5000;', source)
-        self.assertIn('constexpr uint32_t kStateChangeCheckMs = 250;', source)
+        self.assertIn('constexpr uint32_t kStateChangeCheckMs = 1000;', source)
         for field in ('"schemaVersion"', '"deviceId"', '"bootId"',
                       '"seq"', '"sampledUptimeMs"', '"state"'):
             self.assertIn(field, source)

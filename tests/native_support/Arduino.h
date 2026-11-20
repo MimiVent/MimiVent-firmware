@@ -18,6 +18,7 @@ class String {
   String(T n): value(std::to_string(n)) {}
   const char* c_str() const { return value.c_str(); }
   size_t length() const { return value.size(); }
+  bool reserve(size_t size) { value.reserve(size); return true; }
   bool isEmpty() const { return value.empty(); }
   bool startsWith(const char* prefix) const { return value.rfind(prefix, 0) == 0; }
   int indexOf(char c, int start = 0) const { auto n = value.find(c, start); return n == std::string::npos ? -1 : int(n); }

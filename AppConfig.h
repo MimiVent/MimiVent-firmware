@@ -2,13 +2,7 @@
 
 #include <Arduino.h>
 
-#ifndef MIMIVENT_ENABLE_WIFI
-#define MIMIVENT_ENABLE_WIFI 0
-#endif
-
-#ifndef MIMIVENT_WIFI_READ_CONTROL
-#define MIMIVENT_WIFI_READ_CONTROL 0
-#endif
+#include "FirmwareTransport.h"
 
 // P3-A 按需 OTA 工作区尚待真机 OTA 回归，只在资源实验构建中启用。
 #ifndef MIMIVENT_OTA_DYNAMIC_WORKSPACE

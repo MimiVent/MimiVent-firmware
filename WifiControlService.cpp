@@ -228,22 +228,8 @@ int beginWrite(const char* id,const char* token,const char* path,const uint8_t* 
  if(slot<0){
   for(size_t i=0;i<kWriteCapacity;++i)if(uint32_t(now-writes[i].at)>kWriteRetentionMs){slot=i;break;}
  }
- if(slot<0){
-  // 表满时优先回收最旧的终态记录。未知/处理中记录仍保留完整保护窗口，
-  // 避免用户重试时把可能已执行的请求再次执行；终态结果仍由 Gateway/App
-  // 缓存，设备端只在容量压力下让出槽位，防止连续控制后长期返回 429。
-  uint32_t oldestAge=0;
-  for(size_t i=0;i<kWriteCapacity;++i){
-   if(writes[i].code==0)continue;
-   const uint32_t age=uint32_t(now-writes[i].at);
-   if(slot<0||age>oldestAge){slot=static_cast<int>(i);oldestAge=age;}
-  }
-  if(slot>=0){
-   Serial.printf("[wifi-write] recycle completed record index=%d status=%u age_ms=%lu\n",
-                 slot,unsigned(writes[slot].code),static_cast<unsigned long>(oldestAge));
-  }
- }
- if(slot<0)return -2; // 仅当保护窗口内的记录全都仍待确认时拒绝新控制。
+ // 终态也可能丢失 ACK，不能在保护期内提前淘汰；否则同编号重试会重复执行。
+ if(slot<0)return -2;
  const WriteRecord previous=writes[slot];
  WriteRecord& w=writes[slot];memset(&w,0,sizeof(w));
  strncpy(w.id,id,sizeof(w.id)-1);strncpy(w.token,token,sizeof(w.token)-1);
@@ -304,7 +290,8 @@ bool wifiControlServiceCommand(const char* token,const char* requestId,const cha
  if((!controlPath&&!settingsPath&&!leaseReleasePath)||!body||strlen(body)>256){*statusCode=400;*responseBody="{\"error\":\"INVALID_REQUEST\"}";return true;}
  uint8_t digest[32];
  if(mbedtls_sha256(reinterpret_cast<const uint8_t*>(body),strlen(body),digest,0)!=0){*statusCode=503;*responseBody="{\"error\":\"DEDUP_UNAVAILABLE\"}";return true;}
- const int existing=findWrite(requestId,auth.tokenId);
+ // 去重身份使用 serviceId：凭据轮换后 requestId 保护不丢失。
+ const int existing=findWrite(requestId,auth.serviceId);
  if(existing>=0){
   const char* conflict=writeConflict(writes[existing],path,digest);
   if(conflict){*statusCode=409;*responseBody=String("{\"error\":\"")+conflict+"\"}";return true;}
@@ -320,7 +307,7 @@ bool wifiControlServiceCommand(const char* token,const char* requestId,const cha
  if(otaManagerIsActive()){*statusCode=423;*responseBody="{\"error\":\"OTA_BUSY\"}";return true;}
  if(!leaseReleasePath&&!wifiControlLeaseAcquire(auth.tokenId,now)){*statusCode=423;*responseBody="{\"error\":\"WIFI_IN_USE\"}";return true;}
  if(!rateAllowed(auth.tokenId,now)){*statusCode=429;*responseBody="{\"error\":\"RATE_LIMITED\"}";return true;}
- const int pendingSlot=beginWrite(requestId,auth.tokenId,path,digest,now);
+ const int pendingSlot=beginWrite(requestId,auth.serviceId,path,digest,now);
  if(pendingSlot==-2){*statusCode=429;*responseBody="{\"error\":\"DEDUP_WINDOW_FULL\"}";return true;}
  if(pendingSlot<0){*statusCode=503;*responseBody="{\"error\":\"DEDUP_UNAVAILABLE\"}";return true;}
  if(leaseReleasePath){

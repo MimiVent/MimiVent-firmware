@@ -1,4 +1,5 @@
 #include "OtaManager.h"
+#include "OtaTransportPolicy.h"
 
 #include <esp_app_format.h>
 #include <esp_image_format.h>
@@ -570,10 +571,11 @@ bool finishOtaPackageBlock() {
   const uint32_t expectedDurable = min(receivedSize, expectedSize);
   if (expectedDurable < expectedSize &&
       (expectedDurable % kCheckpointBytes) == 0) {
+    // 两个偏移必须指向同一块边界，否则续传会把较早的压缩块写到较后的镜像偏移。
+    // 与差分包保持一致：仅在 16 KiB 检查点同时持久化固件和包偏移。
     packageCheckpointOffset = packageReceivedSize;
+    if (!saveCheckpoint(expectedDurable)) {packageFailure="CHECKPOINT_WRITE";return false;}
   }
-  if (expectedDurable < expectedSize && expectedDurable > checkpointOffset &&
-      !saveCheckpoint(expectedDurable)) {packageFailure="CHECKPOINT_WRITE";return false;}
   return true;
 }
 
@@ -1121,7 +1123,7 @@ void processMessage(const Message& message) {
     }
     if (command == "CAPS") {
       if (!active || ownerConnection == message.connection) ownerConnection = message.connection;
-      OtaBleAdapter::publishStatus(String("CAPS|2|resume=1|pause=1|install=1|maxChunk=512|window=4|checkpoint=16384|sha256=1|signature=1|signatureFormat=1|downgrade=1|package=1|packageFormat=2|delta=1|deltaFormat=2|partitionProfile=") + FIRMWARE_PARTITION_PROFILE + "|deviceId=" + getStableDeviceId(), message.connection);
+      OtaBleAdapter::publishStatus(String("CAPS|2|resume=1|pause=1|install=1|maxChunk=512|window=4|checkpoint=16384|sha256=1|signature=1|signatureFormat=1|downgrade=1|package=1|packageFormat=2|delta=1|deltaFormat=2|partitionProfile=") + FIRMWARE_PARTITION_PROFILE + "|transportTarget=" + MIMIVENT_TRANSPORT_NAME + "|deviceId=" + getStableDeviceId(), message.connection);
       return;
     }
     if (command == "INFO") {
@@ -1450,6 +1452,13 @@ void finishUpdate(uint16_t connection, const String& taskId) {
   if (esp_ota_get_partition_description(targetPartition, &imageDescription) != ESP_OK ||
       expectedVersion != String(imageDescription.version)) {
     abortUpdate("VERSION_MISMATCH", true); return;
+  }
+  if (!otaIsKnownStableNasRollback(MIMIVENT_TRANSPORT_NAME, expectedDigest.c_str()) &&
+      !otaImageMatchesTransport(expectedSize, FIRMWARE_TRANSPORT_TARGET_MARKER,
+      [](size_t offset, void* output, size_t bytes) {
+        return esp_partition_read(targetPartition, offset, output, bytes) == ESP_OK;
+      })) {
+    abortUpdate("TRANSPORT_TARGET_MISMATCH", true); return;
   }
   verifiedForInstall = true;
   if (compressedPackage || deltaPackage) packageCheckpointOffset = expectedPackageSize;

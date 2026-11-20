@@ -32,17 +32,17 @@ class StatisticsCapacityTest(unittest.TestCase):
 
         # 结构尺寸必须是文档锁定的值，任何漂移都说明布局被改动。
         self.assertEqual(row['headerBytes'], 56)
-        self.assertEqual(row['dailyRecordBytes'], 312)
+        self.assertEqual(row['dailyRecordBytes'], 216)
         self.assertEqual(row['eventRecordBytes'], 20)
-        self.assertEqual(row['snapshotBytes'], 14536)
+        self.assertEqual(row['snapshotBytes'], 11656)
         self.assertEqual(row['snapshotBytes'], row['expectedBytes'])
 
-        # SPIFFS 占用：78 数据页 + 2 索引页 = 5 个 4 KiB block，与 §5.3 一致。
-        self.assertEqual(row['dataPages'], 58)
+        # schema 8：47 数据页 + 1 索引页 = 3 个 4 KiB block（主机占用估算）。
+        self.assertEqual(row['dataPages'], 47)
         self.assertEqual(row['indexPages'], 1)
-        self.assertEqual(row['blocks'], 4)
-        self.assertEqual(row['spiffsBytes'], 16384)
-        self.assertEqual(row['twoSlotBytes'], 32768)
+        self.assertEqual(row['blocks'], 3)
+        self.assertEqual(row['spiffsBytes'], 12288)
+        self.assertEqual(row['twoSlotBytes'], 24576)
         self.assertEqual(row['partitionBytes'], 524288)
         self.assertGreater(row['remainingBytes'], 400 * 1024)
 

@@ -86,7 +86,17 @@ int main(){
  for(size_t i=2;i<kWriteCapacity;++i){char id[37];snprintf(id,sizeof(id),"%08x-0000-4000-8000-000000000000",unsigned(i+10));
   assert(beginWrite(id,phone,"/api/timed",onHash,100)==int(i));}
  const char* nextId="ffffffff-0000-4000-8000-000000000000";
+ // 满表内含终态也不能提前淘汰：App 可能在 ACK 丢失后用原编号重试。
+ auto protectedWrites=files;
  assert(beginWrite(nextId,phone,"/api/timed",offHash,100)==-2);
+ assert(files==protectedWrites);assert(findWrite(firstId,phone)==0);
+ fakeMillis=1234;reboot();
+ assert(writes[0].at==1234&&findWrite(firstId,phone)==0);
+ assert(beginWrite(nextId,phone,"/api/timed",offHash,1234+kWriteRetentionMs)==-2);
+ assert(findWrite(firstId,phone)==0);
+ // 再次重启也不能用 boot=0 提前回收；运行满保护期后才可让出槽位。
+ fakeMillis=3;reboot();
+ assert(beginWrite(nextId,phone,"/api/timed",offHash,4)==-2);
  const auto previous=writes[0];spiffsWriteFailure=true;
  assert(beginWrite(nextId,phone,"/api/timed",offHash,700000)==-1);
  assert(!memcmp(&previous,&writes[0],sizeof(previous)));spiffsWriteFailure=false;

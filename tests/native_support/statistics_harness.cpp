@@ -15,7 +15,7 @@ TimingSettings settingsStoreGet(TimingProfile) { return {30000, 30000, 120000, 6
 void emit(const char* name,const String& json) { std::cout << name << '\t' << json.c_str() << '\n'; }
 int main() {
   statisticsStoreBegin();
-  assert(statisticsStoreSchemaVersion()==7);
+  assert(statisticsStoreSchemaVersion()==8);
   assert(statisticsStoreSetClock(fakeNow,480));
   statisticsStoreRecordActivity(120);
   fakeNow+=30; fakeMillis+=30000; statisticsStoreRecordActivity(120);

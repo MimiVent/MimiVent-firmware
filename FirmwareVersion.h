@@ -1,10 +1,13 @@
 #pragma once
 
+#include "FirmwareTransport.h"
+
 // 遵循语义化版本：MAJOR.MINOR.PATCH。功能兼容的小改动增加 PATCH，新增功能增加 MINOR。
 #define FIRMWARE_VERSION_MAJOR 0
 #define FIRMWARE_VERSION_MINOR 7
-#define FIRMWARE_VERSION_PATCH 0
-#define FIRMWARE_VERSION "0.7.0"
+#define FIRMWARE_VERSION_PATCH 1
+#define FIRMWARE_VERSION "0.7.1"
+#define FIRMWARE_TRANSPORT_TARGET_MARKER "MIMIVENT_TRANSPORT_TARGET=" MIMIVENT_TRANSPORT_NAME
 #define FIRMWARE_IMAGE_MARKER "MIMIVENT_FIRMWARE_VERSION=" FIRMWARE_VERSION
 // OTA App 使用此镜像元数据判断降级后的统计存储兼容性。
 // schema 6：StoreHeaderV5 增加了 migratedThroughDayKey（52→56 字节）。
@@ -27,5 +30,5 @@
 
 // BLE 控制协议 v2 从 App v0.3.0 起可用；更旧版本不能控制此固件。
 // 0.6.0 是第一个认识短键统计 JSON 的 App；更早的版本会把所有桶读成 0。
-// 本发布版本已移除设备 HTTPS；NAS 控制由支持 MQTT 的 App 0.7.0 及更新版本提供。
-#define FIRMWARE_MINIMUM_APP_VERSION "0.7.0"
+// 单服务授权协议要求配套 App 0.7.1 或更新版本。
+#define FIRMWARE_MINIMUM_APP_VERSION "0.7.1"

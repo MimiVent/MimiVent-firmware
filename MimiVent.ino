@@ -64,6 +64,7 @@ void setup() {
   Serial.println();
   Serial.printf("MimiVent v%s ready\n", FIRMWARE_VERSION);
   Serial.println(FIRMWARE_IMAGE_MARKER);
+  Serial.println(FIRMWARE_TRANSPORT_TARGET_MARKER);
   Serial.println(FIRMWARE_STATISTICS_SCHEMA_MARKER);
   // 镜像内必须带这个标记：OTA 校验靠它判断目标固件能读的最低落盘格式。
   Serial.println(FIRMWARE_MIN_READABLE_STATISTICS_SCHEMA_MARKER);

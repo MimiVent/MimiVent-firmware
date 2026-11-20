@@ -96,6 +96,7 @@ ControlApiResponse statusResponse(TimingProfile viewProfile) {
            "\"autoExhaustMs\":%lu,\"manualExhaustMs\":%lu,\"pauseMs\":%lu,\"firmware\":\"%s\",\"minimumAppVersion\":\"%s\",\"statisticsSchema\":%u,"
            "\"storageSchema\":%u,\"minReadableStorageSchema\":%u,\"statsRangeApiVersion\":2,"
            "\"tzOffsetSeconds\":%ld,"
+           "\"transportTarget\":\"" MIMIVENT_TRANSPORT_NAME "\",\"transportReady\":" MIMIVENT_TRANSPORT_READY_JSON ","
            "\"capabilities\":%s,\"gattVersion\":%u}",
            status.fanOn ? "true" : "false", status.presenceDetected ? "true" : "false",
            fanControllerModeName(), fanControllerPhaseName(),

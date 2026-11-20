@@ -47,7 +47,7 @@ int main() {
   statisticsStoreTick();
 
   const uint32_t now = static_cast<uint32_t>(fakeNow);
-  const size_t expected = sizeof(StoreHeaderV5) + dailyCount * sizeof(DailyRecordV5) +
+  const size_t expected = sizeof(StoreHeaderV5) + dailyCount * sizeof(DailyRecord) +
                           eventCount * sizeof(EventRecordV5);
   const char* slot = slotPathForGeneration(generation);
   const size_t actual = files[slot].size();
@@ -72,7 +72,7 @@ int main() {
             << ",\"snapshotBytes\":" << actual
             << ",\"expectedBytes\":" << expected
             << ",\"headerBytes\":" << sizeof(StoreHeaderV5)
-            << ",\"dailyRecordBytes\":" << sizeof(DailyRecordV5)
+            << ",\"dailyRecordBytes\":" << sizeof(DailyRecord)
             << ",\"eventRecordBytes\":" << sizeof(EventRecordV5)
             << ",\"persistUs\":" << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
             << ",\"verifyUs\":" << std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count()

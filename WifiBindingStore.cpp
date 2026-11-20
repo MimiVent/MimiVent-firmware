@@ -1,12 +1,12 @@
 #include "WifiBindingStore.h"
 #if MIMIVENT_ENABLE_WIFI && MIMIVENT_WIFI_READ_CONTROL
 #include "WifiBindingCore.h"
-#include "WifiDeviceIdentity.h"
 #include "WifiControlLease.h"
 #include "WifiStorageBudget.h"
 #include "OtaCheckpointStore.h"
 #include <WiFi.h>
 #include <esp_random.h>
+#include <esp_mac.h>
 #include <mbedtls/sha256.h>
 #include <nvs.h>
 #include <freertos/queue.h>
@@ -19,40 +19,43 @@ nvs_handle_t storage;
 bool storageOpen=false;std::atomic<bool> ready{false};
 const char* storeState="UNINITIALIZED";
 portMUX_TYPE mux=portMUX_INITIALIZER_UNLOCKED;
-Record authActive{}; Pending authPending{};
-QueueHandle_t verifiedQueue=nullptr;
-struct Verified { char id[33]; };
+Record authSnapshot{};
+char hardwareDeviceId[kIdLength]{};
 void publish() {
- portENTER_CRITICAL(&mux); authActive=core.active;authPending=core.pending;portEXIT_CRITICAL(&mux);
+ portENTER_CRITICAL(&mux); authSnapshot=core.active; portEXIT_CRITICAL(&mux);
 }
 String encode(cJSON* value) {char* raw=cJSON_PrintUnformatted(value);String s=raw?raw:"{\"error\":\"MEMORY\"}";cJSON_free(raw);cJSON_Delete(value);return s;}
 String error(const char* text) {auto* v=cJSON_CreateObject();cJSON_AddStringToObject(v,"error",text);return encode(v);}
 const char* field(cJSON* r,const char* name) {auto* v=cJSON_GetObjectItemCaseSensitive(r,name);return cJSON_IsString(v)?v->valuestring:"";}
 bool label(const char* s,size_t max) {size_t n=strlen(s);if(!n||n>max)return false;for(size_t i=0;i<n;++i)if(!isalnum((unsigned char)s[i])&&s[i]!='-'&&s[i]!='_')return false;return true;}
-bool uuidValid(const char* s){
- if(strlen(s)!=36)return false;
- for(size_t i=0;i<36;++i){bool dash=i==8||i==13||i==18||i==23;if(dash?s[i]!='-':!isxdigit((unsigned char)s[i]))return false;}
- return true;
+bool uuidValid(const char* s){return uuidText(s);}
+// 硬件派生 deviceId：SHA256("mimivent-c3:" + 出厂 MAC) 前 16 字节。
+// 不直接暴露 MAC，擦除 flash / 升级 / 清配置后保持稳定；Gateway 用它关联历史。
+void deriveHardwareDeviceId() {
+ uint8_t mac[6]{};
+ if(esp_read_mac(mac, ESP_MAC_WIFI_STA)!=ESP_OK) { hardwareDeviceId[0]=0; return; }
+ const char* prefix="mimivent-c3:";
+ char material[24]{};
+ strncpy(material,prefix,sizeof(material)-1);
+ size_t offset=strlen(prefix);
+ for(size_t i=0;i<6&&offset+2<sizeof(material);++i){snprintf(material+offset,3,"%02x",mac[i]);offset+=2;}
+ uint8_t digest[32]{};
+ mbedtls_sha256(reinterpret_cast<const uint8_t*>(material),offset,digest,0);
+ constexpr char hex[]="0123456789abcdef";
+ for(size_t i=0;i<16;++i){hardwareDeviceId[i*2]=hex[digest[i]>>4];hardwareDeviceId[i*2+1]=hex[digest[i]&0x0f];}
+ hardwareDeviceId[32]=0;
 }
 bool writeSlot(const char* slot,const Record& r) {
  if(nvs_set_blob(storage,slot,&r,sizeof(r))!=ESP_OK||nvs_commit(storage)!=ESP_OK)return false;
  Record check{};size_t n=sizeof(check);
  return nvs_get_blob(storage,slot,&check,&n)==ESP_OK&&n==sizeof(check)&&valid(check)&&!memcmp(&check,&r,sizeof(r));
 }
-bool empty(const Record& r){for(const auto& e:r.entries)if(e.used)return false;return true;}
-bool removeEmptySlots(){
- for(const char* key:{"slot-a","slot-b"}){const auto rc=nvs_erase_key(storage,key);if(rc!=ESP_OK&&rc!=ESP_ERR_NVS_NOT_FOUND)return false;}
- return nvs_commit(storage)==ESP_OK;
-}
 bool save(const Record& r,void*) {
- // 成功响应前镜像到两个槽，避免最新槽以后损坏时恢复已撤销 token。
- const char* first=(r.sequence&1)?"slot-b":"slot-a";
- const char* second=(r.sequence&1)?"slot-a":"slot-b";
+ const char* first=(r.sequence&1)?"svc-b":"svc-a";
+ const char* second=(r.sequence&1)?"svc-a":"svc-b";
  if(writeSlot(first,r)&&writeSlot(second,r)){
-  // 两槽均已确认空表后才删除；断电只会留下空表，不会复活已撤销 token。
-  if(empty(r)&&!removeEmptySlots()){storeState="STORE_UNCONFIRMED";ready=false;return false;}
   nvs_stats_t stats{};if(nvs_get_stats(nullptr,&stats)==ESP_OK)
-   Serial.printf("[wifi-bind] sequence=%lu nvs-used=%u nvs-free=%u\n",(unsigned long)r.sequence,stats.used_entries,stats.free_entries);
+   Serial.printf("[wifi-svc] sequence=%lu nvs-used=%u nvs-free=%u\n",(unsigned long)r.sequence,stats.used_entries,stats.free_entries);
   return true;
  }
  storeState="STORE_UNCONFIRMED";ready=false;return false;
@@ -61,13 +64,9 @@ bool load(const char* key,Record& r,bool& exists) {
  size_t n=0;const auto rc=nvs_get_blob(storage,key,nullptr,&n);exists=rc!=ESP_ERR_NVS_NOT_FOUND;
  if(!exists)return true;
  if(rc!=ESP_OK)return false;
- if(n==sizeof(r))return nvs_get_blob(storage,key,&r,&n)==ESP_OK;
- if(n==sizeof(RecordV1)){
-  RecordV1 old{};size_t oldLength=sizeof(old);
-  if(nvs_get_blob(storage,key,&old,&oldLength)!=ESP_OK||oldLength!=sizeof(old)||!validV1(old))return false;
-  r=migrateV1(old);return true;
- }
- return false;
+ if(n!=sizeof(r))return false;
+ if(nvs_get_blob(storage,key,&r,&n)!=ESP_OK||n!=sizeof(r))return false;
+ return true;
 }
 void randomHex(char* output,size_t bytes) {uint8_t raw[16];esp_fill_random(raw,bytes);for(size_t i=0;i<bytes;++i)snprintf(output+i*2,3,"%02x",raw[i]);}
 void randomToken(char token[44]) {
@@ -76,19 +75,19 @@ void randomToken(char token[44]) {
  for(uint8_t b:raw){bits=(bits<<8)|b;count+=8;while(count>=6){count-=6;token[out++]=alphabet[(bits>>count)&63];}}
  if(count)token[out++]=alphabet[(bits<<(6-count))&63];token[out]=0;
 }
+void hashToken(const char* token,uint8_t out[32]) {mbedtls_sha256(reinterpret_cast<const uint8_t*>(token),strlen(token),out,0);}
+const char* entryStageText(const ServiceEntry& e) {
+ if(!e.used) return "none";
+ if(e.used==kEntryActive) return "active";
+ return e.stage==kStageActivated ? "activated" : "pending";
+}
 }
 void wifiBindingBegin() {
- // 只记录命名空间占用，不读取/输出凭据值，用于 20 KiB NVS 容量验收。
+ deriveHardwareDeviceId();
  nvs_iterator_t iterator=nullptr;char seen[24][16]{};size_t seenCount=0;
  esp_err_t iteratorResult=nvs_entry_find("nvs",nullptr,NVS_TYPE_ANY,&iterator);
  while(iteratorResult==ESP_OK){
   nvs_entry_info_t info{};nvs_entry_info(iterator,&info);bool known=false;
-  if(!strcmp(info.namespace_name,"mv-wifi-v1")){
-   nvs_handle_t handle;if(nvs_open(info.namespace_name,NVS_READONLY,&handle)==ESP_OK){size_t length=0;
-    if(nvs_get_blob(handle,info.key,nullptr,&length)==ESP_OK)
-      Serial.printf("[nvs-budget] legacy-namespace-key=%s blobBytes=%u\n",info.key,length);
-    nvs_close(handle);}
-  }
   for(size_t i=0;i<seenCount;++i)if(!strcmp(seen[i],info.namespace_name))known=true;
   if(!known&&seenCount<24){
    strncpy(seen[seenCount++],info.namespace_name,15);nvs_handle_t handle;
@@ -98,139 +97,164 @@ void wifiBindingBegin() {
   iteratorResult=nvs_entry_next(&iterator);
  }
  nvs_release_iterator(iterator);
- verifiedQueue=xQueueCreate(2,sizeof(Verified));
- if(!verifiedQueue){storeState="MEMORY_UNAVAILABLE";return;}
  if(nvs_open("mv-bindings",NVS_READWRITE,&storage)!=ESP_OK){storeState="STORAGE_UNAVAILABLE";return;}
  storageOpen=true;Record a{},b{};bool ae=false,be=false;
- if(!load("slot-a",a,ae)||!load("slot-b",b,be)){storeState="RECORD_UNREADABLE";return;}
- if((ae&&a.version!=kRecordVersion)||(be&&b.version!=kRecordVersion)){storeState="MIGRATION_REQUIRED";return;}
+ if(!load("svc-a",a,ae)||!load("svc-b",b,be)){storeState="RECORD_UNREADABLE";return;}
  const bool av=ae&&valid(a),bv=be&&valid(b);
- if((ae||be)&&!av&&!bv){storeState="BINDINGS_CORRUPT";return;}
+ if((ae&&!av)||(be&&!bv)){storeState="BINDINGS_CORRUPT";return;}
  if(av&&bv&&a.sequence==b.sequence&&memcmp(&a,&b,sizeof(a))){storeState="BINDINGS_CORRUPT";return;}
  if(av||bv)core.active=(!bv||(av&&a.sequence>=b.sequence))?a:b;
+ // 重启后只清理未激活候选；已激活候选需留给 Gateway 核验或明确回退。
+ if(!core.recoverAfterRestart(save,nullptr)){
+  storeState=core.active.sequence==UINT32_MAX?"SEQUENCE_EXHAUSTED":"STORE_UNCONFIRMED";return;
+ }
+ // 硬件身份必须固定在记录里；首次启动或 MAC 变化时重写。
+ if(hardwareDeviceId[0]){
+  if(strcmp(core.active.deviceId,hardwareDeviceId)){
+   if(core.active.sequence==UINT32_MAX){storeState="SEQUENCE_EXHAUSTED";return;}
+   Record next=core.active;strncpy(next.deviceId,hardwareDeviceId,sizeof(next.deviceId)-1);
+   ++next.sequence;seal(next);
+   if(!save(next,nullptr)){storeState="STORE_UNCONFIRMED";return;}
+   core.active=next;
+  }
+ }
  if(av||bv){
-  if((!av||memcmp(&a,&core.active,sizeof(a)))&&!writeSlot("slot-a",core.active)){storeState="STORE_UNCONFIRMED";return;}
-  if((!bv||memcmp(&b,&core.active,sizeof(b)))&&!writeSlot("slot-b",core.active)){storeState="STORE_UNCONFIRMED";return;}
-  if(empty(core.active)&&!removeEmptySlots()){storeState="STORE_UNCONFIRMED";return;}
+  if((!av||memcmp(&a,&core.active,sizeof(a)))&&!writeSlot("svc-a",core.active)){storeState="STORE_UNCONFIRMED";return;}
+  if((!bv||memcmp(&b,&core.active,sizeof(b)))&&!writeSlot("svc-b",core.active)){storeState="STORE_UNCONFIRMED";return;}
  }
  ready=true;storeState="READY";publish();
  nvs_stats_t stats{};if(nvs_get_stats(nullptr,&stats)==ESP_OK)
-  Serial.printf("[wifi-bind] ready sequence=%lu nvs-used=%u nvs-free=%u\n",(unsigned long)core.active.sequence,stats.used_entries,stats.free_entries);
+  Serial.printf("[wifi-svc] ready sequence=%lu nvs-used=%u nvs-free=%u\n",(unsigned long)core.active.sequence,stats.used_entries,stats.free_entries);
 }
 void wifiBindingUpdate(){
- if(!ready)return;core.tick(millis());Verified event{};
- while(xQueueReceive(verifiedQueue,&event,0)==pdTRUE)
-  if(core.pending.exists&&!strcmp(core.pending.entry.id,event.id))core.pending.verified=true;
- publish();
+ if(!ready)return;core.tick(millis());publish();
 }
 bool wifiBindingReady(){return ready;}
 const char* wifiBindingState(){return storeState;}
+const char* wifiBindingDeviceId(){return hardwareDeviceId;}
 WifiAuthorization wifiBindingAuthorize(const char* token,uint32_t now){
- WifiAuthorization result{};if(!ready||strlen(token)!=43)return result;
+ WifiAuthorization result{};if(!ready||!token||strlen(token)!=43)return result;
  for(size_t i=0;i<43;++i)if(!isalnum((unsigned char)token[i])&&token[i]!='-'&&token[i]!='_')return result;
- uint8_t hash[32];mbedtls_sha256(reinterpret_cast<const uint8_t*>(token),43,hash,0);
+ uint8_t hash[32];hashToken(token,hash);
  portENTER_CRITICAL(&mux);
- for(const auto& e:authActive.entries)if(e.used&&equalHash(hash,e.hash)){result.valid=true;strcpy(result.tokenId,e.id);}
- if(!result.valid&&authPending.exists&&uint32_t(now-authPending.started)<kTtlMs&&equalHash(hash,authPending.entry.hash)){
-  result.valid=true;result.pending=true;strcpy(result.tokenId,authPending.entry.id);
+ if(authSnapshot.active.used==kEntryActive&&equalHash(hash,authSnapshot.active.credentialHash)){
+  result.valid=true;strcpy(result.tokenId,authSnapshot.active.credentialId);strcpy(result.serviceId,authSnapshot.active.serviceId);
+  result.authRevision=authSnapshot.active.authRevision;
+ }
+ if(!result.valid&&authSnapshot.candidate.used==kEntryCandidate&&equalHash(hash,authSnapshot.candidate.credentialHash)){
+  result.valid=true;result.pending=true;strcpy(result.tokenId,authSnapshot.candidate.credentialId);strcpy(result.serviceId,authSnapshot.candidate.serviceId);
+  result.authRevision=authSnapshot.candidate.authRevision;
  }
  portEXIT_CRITICAL(&mux);return result;
 }
 bool wifiBindingOwnerAllowed(const char* owner){
- if(!ready||!owner)return false;
- bool any=false;bool allowed=false;
- portENTER_CRITICAL(&mux);
- for(const auto& e:authActive.entries)if(e.used){any=true;if(!strcmp(e.owner,owner))allowed=true;}
- portEXIT_CRITICAL(&mux);
- return !any||allowed;
+ // BLE 管理通道已由 BluetoothManager 强制 encrypted+bonded；此处不再区分 owner。
+ return ready&&owner&&owner[0];
 }
-bool wifiBindingRevokeAllowed(const char* owner,const char* tokenId){
- if(!ready||!owner||!tokenId)return false;
- bool found=false;bool allowed=false;
- portENTER_CRITICAL(&mux);
- for(const auto& e:authActive.entries)if(e.used&&!strcmp(e.id,tokenId)){found=true;allowed=!strcmp(e.owner,owner);}
- portEXIT_CRITICAL(&mux);
- return !found||allowed;
-}
+bool wifiBindingRevokeAllowed(const char*,const char*){return ready;}
 bool wifiBindingAddAuthTokens(cJSON* state){
  if(!state||!ready)return false;
- Record snapshot{};
- portENTER_CRITICAL(&mux);snapshot=authActive;portEXIT_CRITICAL(&mux);
- auto* tokens=cJSON_AddArrayToObject(state,"authTokens");
- if(!tokens)return false;
- constexpr char hex[]="0123456789abcdef";
- for(const auto& entry:snapshot.entries){
-  if(!entry.used)continue;
-  auto* token=cJSON_CreateObject();
-  if(!token)return false;
-  char hash[65]{};
-  for(size_t i=0;i<sizeof(entry.hash);++i){
-   hash[i*2]=hex[entry.hash[i]>>4];
-   hash[i*2+1]=hex[entry.hash[i]&0x0f];
-  }
-  const bool added=cJSON_AddStringToObject(token,"tokenId",entry.id)&&
-                   cJSON_AddStringToObject(token,"tokenHash",hash);
-  if(!added){cJSON_Delete(token);return false;}
-  cJSON_AddItemToArray(tokens,token);
+ Record snapshot{};char device[kIdLength]{};
+ portENTER_CRITICAL(&mux);snapshot=authSnapshot;strncpy(device,hardwareDeviceId,sizeof(device)-1);portEXIT_CRITICAL(&mux);
+ // 单服务授权身份：Gateway 用它核验设备端已激活哪个服务凭据。
+ // 不再输出每手机 token 摘要（三槽模型已下线）。
+ auto* service=cJSON_AddObjectToObject(state,"service");
+ if(!service)return false;
+ cJSON_AddStringToObject(service,"deviceId",device);
+ cJSON_AddStringToObject(service,"serviceId",snapshot.active.serviceId);
+ cJSON_AddStringToObject(service,"credentialId",snapshot.active.credentialId);
+ cJSON_AddNumberToObject(service,"authRevision",snapshot.active.authRevision);
+ cJSON_AddStringToObject(service,"state",snapshot.active.used?entryStageText(snapshot.active):"unconfigured");
+ if(snapshot.candidate.used){
+  cJSON_AddStringToObject(service,"candidateTransactionId",snapshot.candidate.transactionId);
+  cJSON_AddStringToObject(service,"candidateServiceId",snapshot.candidate.serviceId);
+  cJSON_AddStringToObject(service,"candidateCredentialId",snapshot.candidate.credentialId);
+  cJSON_AddNumberToObject(service,"candidateAuthRevision",snapshot.candidate.authRevision);
+  cJSON_AddStringToObject(service,"candidateState",entryStageText(snapshot.candidate));
  }
  return true;
 }
-bool wifiBindingMarkVerified(const char* tokenId){Verified event{};strncpy(event.id,tokenId,32);return verifiedQueue&&xQueueSend(verifiedQueue,&event,0)==pdTRUE;}
 String wifiBindingRequest(cJSON* root,const char* owner){
  if(!ready)return error(storeState);
- if(!owner||strlen(owner)!=14||owner[1]!='-')return error("PAIRING_REQUIRED");
- wifiBindingUpdate();const char* op=field(root,"op");const char* id=field(root,"tokenId");
+ if(!owner||!owner[0])return error("PAIRING_REQUIRED");
+ wifiBindingUpdate();const char* op=field(root,"op");
  auto* out=cJSON_CreateObject();const char* failure=nullptr;const auto now=millis();
- if(!strcmp(op,"wifi.bind.open")){
+ if(!strcmp(op,"wifi.service.status")){
+  cJSON_AddStringToObject(out,"deviceId",hardwareDeviceId);
+  cJSON_AddStringToObject(out,"state",core.active.active.used?entryStageText(core.active.active):"unconfigured");
+  if(core.active.active.used){
+   cJSON_AddStringToObject(out,"serviceId",core.active.active.serviceId);
+   cJSON_AddStringToObject(out,"credentialId",core.active.active.credentialId);
+   cJSON_AddNumberToObject(out,"authRevision",core.active.active.authRevision);
+  }
+  if(core.active.candidate.used){
+   cJSON_AddStringToObject(out,"candidateTransactionId",core.active.candidate.transactionId);
+   cJSON_AddStringToObject(out,"candidateServiceId",core.active.candidate.serviceId);
+   cJSON_AddStringToObject(out,"candidateCredentialId",core.active.candidate.credentialId);
+   cJSON_AddNumberToObject(out,"candidateAuthRevision",core.active.candidate.authRevision);
+   cJSON_AddStringToObject(out,"candidateState",entryStageText(core.active.candidate));
+  }
+ }else if(!strcmp(op,"wifi.service.begin")){
+  const char* transactionId=field(root,"transactionId");
+  const char* serviceId=field(root,"serviceId");
+  const char* providedCredential=field(root,"credentialId");
+  const auto revision=cJSON_GetObjectItemCaseSensitive(root,"authRevision");
   if(WiFi.status()!=WL_CONNECTED)failure="WIFI_UNAVAILABLE";
-  else failure=core.open(owner,now);
-  cJSON_AddNumberToObject(out,"expiresInSec",120);
- }else if(!strcmp(op,"wifi.bind.begin")){
-  nvs_stats_t stats{};bool hasTable=false;for(const auto& entry:core.active.entries)hasTable|=entry.used!=0;
-  if(WiFi.status()!=WL_CONNECTED)failure="WIFI_UNAVAILABLE";
-  else if(nvs_get_stats(nullptr,&stats)!=ESP_OK)failure="STORAGE_UNAVAILABLE";
-  else if(!core.pending.exists&&!WifiStorageBudget::allowsBinding(stats.free_entries,hasTable))failure="WIFI_STORAGE_LOW";
-  else if(!label(field(root,"clientId"),36)||!uuidValid(field(root,"requestId")))failure="INVALID_REQUEST";
+  else if(!uuidValid(transactionId)||!hexId(serviceId))failure="INVALID_REQUEST";
   else{
-   Entry e{};e.used=1;strcpy(e.client,field(root,"clientId"));strcpy(e.owner,owner);randomHex(e.id,16);
-   char token[44];randomToken(token);mbedtls_sha256(reinterpret_cast<const uint8_t*>(token),43,e.hash,0);
-   failure=core.begin(e,field(root,"requestId"),token,cJSON_IsTrue(cJSON_GetObjectItem(root,"replace")),now);
-   memset(token,0,sizeof(token));
+   // BLE 管理通道已强制 encrypted+bonded；begin 即开启一次管理窗口。
+   if(!core.window||strcmp(core.windowOwner,owner))failure=core.open(owner,now);
    if(!failure){
-    cJSON_AddStringToObject(out,"scheme","https");cJSON_AddStringToObject(out,"host",WiFi.localIP().toString().c_str());cJSON_AddNumberToObject(out,"port",8443);
-    cJSON_AddStringToObject(out,"deviceId",wifiDeviceId());cJSON_AddStringToObject(out,"certPinSha256",wifiDevicePin());
-    cJSON_AddStringToObject(out,"tokenId",core.pending.entry.id);cJSON_AddStringToObject(out,"token",core.pending.token);
-    cJSON_AddStringToObject(out,"bindingState","pending");cJSON_AddNumberToObject(out,"expiresInSec",(kTtlMs-uint32_t(now-core.pending.started))/1000);
+    char credential[kIdLength]{};char token[44]{};
+    if(hexId(providedCredential))strncpy(credential,providedCredential,sizeof(credential)-1);
+    else randomHex(credential,16);
+    randomToken(token);
+    uint8_t hash[32];hashToken(token,hash);
+    const uint32_t authRevision=cJSON_IsNumber(revision)?static_cast<uint32_t>(revision->valuedouble):(core.active.active.authRevision+1);
+    failure=core.begin(owner,transactionId,serviceId,credential,hash,authRevision,now,save,nullptr);
+    if(!failure){
+     cJSON_AddStringToObject(out,"deviceId",hardwareDeviceId);
+     cJSON_AddStringToObject(out,"serviceId",serviceId);
+     cJSON_AddStringToObject(out,"credentialId",credential);
+     cJSON_AddStringToObject(out,"token",token);
+     cJSON_AddNumberToObject(out,"authRevision",authRevision);
+     cJSON_AddStringToObject(out,"transactionId",transactionId);
+     cJSON_AddStringToObject(out,"state","pending");
+     cJSON_AddNumberToObject(out,"expiresInSec",(kTtlMs-uint32_t(now-core.windowAt))/1000);
+    }
+    memset(token,0,sizeof(token));
    }
-  }
- }else if(!strcmp(op,"wifi.bind.verify")){
-  const char* token=field(root,"token");
-  const auto auth=wifiBindingAuthorize(token,now);
-  if(!id[0]||!auth.valid||!auth.pending||strcmp(auth.tokenId,id))failure="BINDING_TOKEN_INVALID";
-  else if(!wifiBindingMarkVerified(id))failure="RESOURCE_BUSY";
-  else {wifiBindingUpdate();cJSON_AddBoolToObject(out,"verified",true);}
- }else if(!strcmp(op,"wifi.bind.status")){
-  const char* state=core.status(owner,id,now);
-  if(!strcmp(state,"forbidden"))failure="PERMISSION_DENIED";
-  else {cJSON_AddStringToObject(out,"bindingState",state);cJSON_AddStringToObject(out,"tokenId",id);}
- }else if(!strcmp(op,"wifi.bind.commit")){
-  failure=core.commit(owner,id,now,save,nullptr);cJSON_AddStringToObject(out,"bindingState","active");
- }else if(!strcmp(op,"wifi.bind.cancel"))failure=core.cancel(owner,id);
- else if(!strcmp(op,"wifi.bind.reset")){
-  if(strcmp(field(root,"confirm"),"RESET_ALL_BINDINGS"))failure="CONFIRMATION_REQUIRED";
-  else {
+  } }else if(!strcmp(op,"wifi.service.activate")){
+  const char* transactionId=field(root,"transactionId");
+  if(!uuidValid(transactionId))failure="INVALID_REQUEST";
+  else failure=core.activate(owner,transactionId,now,save,nullptr);
+  if(!failure){cJSON_AddStringToObject(out,"state","active");}
+ }else if(!strcmp(op,"wifi.service.cancel")){
+  failure=core.cancel(owner,field(root,"transactionId"),save,nullptr);
+  if(!failure)cJSON_AddStringToObject(out,"state","cancelled");
+ }else if(!strcmp(op,"wifi.service.confirm")){
+  failure=core.confirm(field(root,"transactionId"),save,nullptr);
+  if(!failure)cJSON_AddStringToObject(out,"state","confirmed");
+ }else if(!strcmp(op,"wifi.service.clear")){
+  if(strcmp(field(root,"confirm"),"CLEAR_SERVICE"))failure="CONFIRMATION_REQUIRED";
+  else{
    failure=core.reset(save,nullptr);
-   if(!failure){wifiControlLeaseReset();cJSON_AddStringToObject(out,"bindingState","reset");}
+   if(!failure){wifiControlLeaseReset();cJSON_AddStringToObject(out,"state","cleared");}
   }
- }
- else if(!strcmp(op,"wifi.revoke")){
-  if(!wifiBindingRevokeAllowed(owner,id))failure="PERMISSION_DENIED";
-  else {failure=core.revoke(id,save,nullptr);cJSON_AddStringToObject(out,"bindingState","revoked");}
- }
- else if(!strcmp(op,"wifi.clients")){
-  auto* list=cJSON_AddArrayToObject(out,"clients");for(const auto& e:core.active.entries)if(e.used&&!strcmp(e.owner,owner)){auto* v=cJSON_CreateObject();cJSON_AddStringToObject(v,"tokenId",e.id);cJSON_AddStringToObject(v,"clientId",e.client);cJSON_AddItemToArray(list,v);}
+ }else if(!strcmp(op,"wifi.service.verify")){
+  // 无副作用只读核验：Gateway 用有效凭据调用，确认设备端授权与网络已就绪。
+  cJSON_AddStringToObject(out,"deviceId",hardwareDeviceId);
+  cJSON_AddStringToObject(out,"serviceId",core.active.active.serviceId);
+  cJSON_AddStringToObject(out,"credentialId",core.active.active.credentialId);
+  cJSON_AddNumberToObject(out,"authRevision",core.active.active.authRevision);
+  cJSON_AddBoolToObject(out,"ready",core.active.active.used==kEntryActive);
+  cJSON_AddBoolToObject(out,"wifiConnected",WiFi.status()==WL_CONNECTED);
+ }else if(!strcmp(op,"wifi.bind.open")||!strcmp(op,"wifi.bind.begin")||!strcmp(op,"wifi.bind.verify")||
+          !strcmp(op,"wifi.bind.commit")||!strcmp(op,"wifi.bind.status")||!strcmp(op,"wifi.bind.cancel")||
+          !strcmp(op,"wifi.bind.reset")||!strcmp(op,"wifi.revoke")||!strcmp(op,"wifi.clients")){
+  // 旧三槽协议已下线；明确引导重新配置而不是返回模糊失败。
+  failure="SERVICE_RECONFIG_REQUIRED";
  }else failure="UNSUPPORTED_OPERATION";
- if(failure&&!strcmp(failure,"WIFI_STORAGE_LOW")&&!core.pending.exists)core.window=false;
  publish();if(failure){cJSON_Delete(out);return error(failure);}return encode(out);
 }
 #endif

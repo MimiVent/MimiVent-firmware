@@ -17,24 +17,30 @@
 
 ## 完整固件
 
-先构建当前完整 WiFi/MQTT 固件，使用 `read4k` 模式：
+正式发布时分别构建 BLE 与 NAS 固件。Remote TLS 尚未实现，不打包 Remote scaffold：
 
 ```sh
-bash scripts/build_firmware.sh read4k
+bash scripts/build_firmware.sh ble
+bash scripts/build_firmware.sh nas
 ```
 
-这会生成 `build/firmware-wifi-read4k/MimiVent.ino.bin`。不要用 `off` 或 `on` 模式的镜像替代完整 WiFi/MQTT 发布镜像。
+这会分别生成 `build/firmware-ble/MimiVent.ino.bin` 和 `build/firmware-nas/MimiVent.ino.bin`。两者共用正式分区布局，但控制传输目标不同；不能互相替代。旧的 `off`、`on`、`read4k` 命令仅为兼容开发流程，不应用作多目标正式发布命令。
 
 再把 `.bin` 打成 App 可选的签名 `.mvota`：
 
 ```sh
+mkdir -p build/ota/release-v0.7.1
 python3 scripts/build_ota_package.py \
-  build/firmware-wifi-read4k/MimiVent.ino.bin \
+  build/firmware-ble/MimiVent.ino.bin \
   --key ~/.config/mimivent/firmware-signing/private.pem \
-  --output build/MimiVent-0.7.0.mvota
+  --output build/ota/release-v0.7.1/MimiVent-Firmware-v0.7.1-ble.mvota
+python3 scripts/build_ota_package.py \
+  build/firmware-nas/MimiVent.ino.bin \
+  --key ~/.config/mimivent/firmware-signing/private.pem \
+  --output build/ota/release-v0.7.1/MimiVent-Firmware-v0.7.1-nas.mvota
 ```
 
-在 App 的“固件升级”页面选择生成的 `.mvota`。文件名应与镜像中嵌入的固件版本一致；后续发布需相应更新命令中的版本号。发布时同时记录固件版本、镜像 SHA-256、包 SHA-256、包格式和 4096 字节分块值；不要把 `.bin` 改扩展名冒充 `.mvota`。
+App 的“固件升级”页面只接受与设备传输类型匹配的签名 `.mvota`。发布前检查镜像目标标记、实际分区、固件版本、包头分块值、镜像 SHA-256 和设备内置公钥验签；发布时同时记录 `.bin` 与 `.mvota` 的 SHA-256。不要把 `.bin` 改扩展名冒充 `.mvota`。升级 App 与 Gateway 的版本组合见对应仓库的 README。
 
 ## 差分固件
 

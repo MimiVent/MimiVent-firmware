@@ -1,55 +1,138 @@
 import pathlib, shutil, subprocess, tempfile, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 
-class BindingsTest(unittest.TestCase):
- def test_transactions_owner_expiry_replacement_and_failure(self):
+class ServiceAuthTest(unittest.TestCase):
+ def test_candidate_activate_cancel_clear_failure_and_corruption(self):
   source=r'''
 #include "WifiBindingCore.h"
 #include <assert.h>
+#include <stdio.h>
 using namespace WifiBindings;
 bool fail=false; int writes=0;
 bool save(const Record& r,void*) { ++writes; assert(valid(r)); return !fail; }
-Entry entry(const char* client,const char* owner,const char* id,int hash) {
- Entry e{};e.used=1;strcpy(e.client,client);strcpy(e.owner,owner);strcpy(e.id,id);memset(e.hash,hash,32);return e;
-}
+#define SID "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define CID "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+#define TX1 "11111111-2222-3333-4444-555555555555"
+#define TX2 "22222222-3333-4444-5555-666666666666"
 int main(){
- Core c; auto a=entry("phone-a","owner-a","11111111111111111111111111111111",1);
- auto b=entry("phone-b","owner-b","22222222222222222222222222222222",2);
- assert(c.begin(a,"req","token",false,0)); assert(!c.open("owner-a",0));
- assert(!c.begin(a,"req","token",false,1)); assert(!c.begin(a,"req","different-token",false,2));
- assert(!strcmp(c.pending.token,"token")); assert(c.open("owner-b",3));
- assert(!strcmp(c.status("owner-b",a.id,3),"forbidden"));
- assert(c.cancel("owner-b",a.id)); assert(c.commit("owner-a",a.id,4,save,nullptr));
- c.pending.verified=true; fail=true;assert(c.commit("owner-a",a.id,5,save,nullptr));
- assert(!c.active.entries[0].used && c.pending.exists);fail=false;
- assert(!c.commit("owner-a",a.id,6,save,nullptr)); int n=writes;
- assert(!c.commit("owner-a",a.id,7,save,nullptr)&&writes==n);
- c.tick(120001); assert(!c.open("owner-b",120002)); assert(!c.begin(b,"b","token-b",false,120003));
- c.pending.verified=true; assert(!c.commit("owner-b",b.id,120004,save,nullptr));
- c.tick(240003); assert(!c.open("owner-a",240004));
- auto third=entry("third","owner-c","33333333333333333333333333333333",3);
- assert(c.open("owner-c",240006)); // owner-a 的窗口尚未过期，应拒绝其他 owner。
- c.tick(360005);
- assert(!c.open("owner-c",360006));assert(!c.begin(third,"c","t",false,360007));
- c.pending.verified=true;assert(!c.commit("owner-c",third.id,360008,save,nullptr));
- auto fourth=entry("fourth","owner-a","44444444444444444444444444444444",4);
- c.tick(480007);
- assert(!c.open("owner-a",480009));assert(!strcmp(c.begin(fourth,"d","t",false,480010),"BINDINGS_FULL"));
- auto replacement=entry("phone-a","owner-a","55555555555555555555555555555555",5);
- assert(c.begin(replacement,"r","t",false,480011));assert(!c.begin(replacement,"r","t",true,480011));
- assert(c.active.entries[0].hash[0]==1);c.pending.verified=true;fail=true;
- assert(c.commit("owner-a",replacement.id,480012,save,nullptr));assert(c.active.entries[0].hash[0]==1);
- fail=false;assert(!c.commit("owner-a",replacement.id,480013,save,nullptr));
- assert(c.active.entries[0].hash[0]==5);assert(valid(c.active));
- auto damaged=c.active;damaged.entries[0].hash[0]^=1;assert(!valid(damaged));
- assert(!c.revoke(replacement.id,save,nullptr));n=writes;assert(!c.revoke(replacement.id,save,nullptr)&&writes==n);
- RecordV1 legacy{};legacy.magic=0x3142564d;legacy.version=1;legacy.bytes=sizeof(legacy);legacy.sequence=9;
- legacy.entries[0]=a;legacy.entries[1]=b;
- legacy.checksum=crc(reinterpret_cast<const uint8_t*>(&legacy),offsetof(RecordV1,checksum));
- assert(validV1(legacy));auto migrated=migrateV1(legacy);assert(valid(migrated));
- assert(migrated.entries[0].used&&migrated.entries[1].used&&!migrated.entries[2].used);
- Core wrap;assert(!wrap.open("owner-a",UINT32_MAX-100));
- assert(!wrap.begin(a,"r","t",false,UINT32_MAX-90));wrap.tick(120000);assert(!wrap.pending.exists&&!wrap.window);
+ const char* owner="AA-BB-CC-DD-EE-FF";
+ // 激活候选只进入待核验阶段；旧服务必须保留到显式 confirm。
+ Core atomic;
+ auto& old=atomic.active.active;
+ old.used=kEntryActive; old.stage=kStageActivated;
+ strcpy(old.serviceId,SID); strcpy(old.credentialId,CID); old.authRevision=7;
+ atomic.active.sequence=1; seal(atomic.active);
+ assert(!atomic.open(owner,0));
+ uint8_t replacementHash[32]; memset(replacementHash,9,32);
+ assert(!atomic.begin(owner,TX1,"cccccccccccccccccccccccccccccccc",
+   "dddddddddddddddddddddddddddddddd",replacementHash,8,1,save,nullptr));
+ assert(!atomic.activate(owner,TX1,2,save,nullptr));
+ assert(!strcmp(atomic.active.active.credentialId,CID));
+ assert(!strcmp(atomic.active.candidate.credentialId,"dddddddddddddddddddddddddddddddd"));
+ assert(atomic.active.candidate.stage==kStageActivated);
+ assert(!atomic.confirm(TX1,save,nullptr));
+ assert(!strcmp(atomic.active.active.credentialId,"dddddddddddddddddddddddddddddddd"));
+ assert(atomic.active.candidate.used==kEntryEmpty);
+
+ Core c;
+ uint8_t h1[32]; memset(h1,1,32);
+ // 未开窗不能 begin
+ assert(!strcmp(c.begin(owner,TX1,SID,CID,h1,1,0,save,nullptr),"BIND_WINDOW_CLOSED"));
+ assert(!c.open(owner,0));
+ // 非法参数
+ assert(!strcmp(c.begin(owner,"bad",SID,CID,h1,1,1,save,nullptr),"INVALID_REQUEST"));
+ assert(!strcmp(c.begin(owner,TX1,"zz",CID,h1,1,1,save,nullptr),"INVALID_REQUEST"));
+ // 生成候选
+ assert(!c.begin(owner,TX1,SID,CID,h1,1,2,save,nullptr));
+ assert(c.active.candidate.used==kEntryCandidate);
+ assert(c.active.candidate.stage==kStagePending);
+ assert(c.active.active.used==kEntryEmpty);
+ assert(valid(c.active));
+ // 事务不匹配
+ assert(!strcmp(c.activate(owner,TX2,3,save,nullptr),"TRANSACTION_MISMATCH"));
+ // 激活
+ assert(!c.activate(owner,TX1,4,save,nullptr));
+ assert(c.active.active.used==kEntryEmpty);
+ assert(c.active.candidate.stage==kStageActivated);
+ assert(c.active.candidate.authRevision==1);
+ assert(!c.confirm(TX1,save,nullptr));
+ assert(c.active.active.used==kEntryActive);
+ assert(c.active.active.authRevision==1);
+ assert(!strcmp(c.active.active.credentialId,CID));
+ // 激活后窗口关闭，需重新开窗
+ assert(!strcmp(c.begin(owner,TX2,SID,CID,h1,2,5,save,nullptr),"BIND_WINDOW_CLOSED"));
+ // 持久化失败不生效
+ fail=true;
+ assert(!c.open(owner,10));
+ uint8_t h2[32]; memset(h2,2,32);
+ assert(!strcmp(c.begin(owner,TX2,SID,CID,h2,2,11,save,nullptr),"BINDINGS_STORE_FAILED"));
+ assert(c.active.active.authRevision==1);
+ fail=false;
+ // 重新开窗后候选过期自动清除，不阻塞
+ assert(!c.open(owner,20));
+ assert(!c.begin(owner,TX2,SID,CID,h2,2,21,save,nullptr));
+ c.tick(21+kTtlMs+1);
+ assert(c.active.candidate.used==0);
+ // 轮换：新事务替换有效授权
+ assert(!c.open(owner,30));
+ uint8_t h3[32]; memset(h3,3,32);
+ assert(!c.begin(owner,TX2,SID,"cccccccccccccccccccccccccccccccc",h3,2,31,save,nullptr));
+ assert(!c.activate(owner,TX2,32,save,nullptr));
+ assert(c.active.active.authRevision==1);
+ assert(c.active.candidate.authRevision==2);
+ assert(c.active.candidate.credentialHash[0]==3);
+ // 事务号不匹配的取消必须拒绝，匹配才清除
+ assert(!strcmp(c.cancel(owner,TX1,save,nullptr),"TRANSACTION_MISMATCH"));
+ assert(!c.cancel(owner,TX2,save,nullptr));
+ assert(c.active.candidate.used==0);
+ assert(c.active.active.authRevision==1);
+ // 重启丢弃未激活候选，但保留已激活待核验候选和旧有效授权。
+ Core pendingRecovery; assert(!pendingRecovery.open(owner,0));
+ assert(!pendingRecovery.begin(owner,TX1,SID,CID,h1,1,1,save,nullptr));
+ assert(pendingRecovery.recoverAfterRestart(save,nullptr));
+ assert(pendingRecovery.active.candidate.used==0);
+ Core activatedRecovery;
+ auto& retained=activatedRecovery.active.active;
+ retained.used=kEntryActive; retained.stage=kStageActivated;
+ strcpy(retained.serviceId,SID); strcpy(retained.credentialId,CID); retained.authRevision=7;
+ activatedRecovery.active.sequence=1; seal(activatedRecovery.active);
+ assert(!activatedRecovery.open(owner,0));
+ assert(!activatedRecovery.begin(owner,TX1,"cccccccccccccccccccccccccccccccc",
+   "dddddddddddddddddddddddddddddddd",h2,8,1,save,nullptr));
+ assert(!activatedRecovery.activate(owner,TX1,2,save,nullptr));
+ assert(activatedRecovery.recoverAfterRestart(save,nullptr));
+ assert(!strcmp(activatedRecovery.active.active.credentialId,CID));
+ assert(activatedRecovery.active.candidate.stage==kStageActivated);
+ activatedRecovery.tick(kTtlMs+10);
+ assert(activatedRecovery.active.candidate.used==kEntryCandidate);
+ // 清除全部
+ assert(!c.reset(save,nullptr));
+ assert(c.active.active.used==0 && c.active.candidate.used==0);
+ // 损坏检测
+ auto damaged=c.active; damaged.sequence=9; damaged.active.used=kEntryActive; damaged.active.stage=kStageActivated;
+ memcpy(damaged.active.serviceId,SID,32); memcpy(damaged.active.credentialId,CID,32); seal(damaged);
+ assert(damaged.magic==0x3142564d);
+ assert(damaged.version==kRecordVersion);
+ assert(damaged.bytes==sizeof(damaged));
+ assert(damaged.sequence==9);
+ assert(damaged.reserved==0);
+ assert(damaged.checksum==crc(reinterpret_cast<const uint8_t*>(&damaged),offsetof(Record,checksum)));
+ assert(validEntry(damaged.active));
+ assert(validEntry(damaged.candidate));
+ assert(damaged.active.used!=kEntryCandidate);
+ assert(damaged.candidate.used!=kEntryActive);
+ assert(memchr(damaged.deviceId,0,sizeof(damaged.deviceId))!=nullptr);
+ assert(!damaged.deviceId[0]);
+ assert(valid(damaged));
+ // 篡改字段但不重算校验和：必须被拒绝（读回损坏检测）
+ damaged.active.credentialHash[0]^=1; assert(!valid(damaged));
+ // 重算校验和后重新有效，说明篡改本身可被 save() 后的 valid() 接受
+ seal(damaged); assert(valid(damaged));
+ damaged.active.used=7; seal(damaged); assert(!valid(damaged));
+ // 序列耗尽
+ Core wrap; wrap.active.sequence=UINT32_MAX;
+ assert(!wrap.open(owner,0));
+ assert(!strcmp(wrap.begin(owner,TX1,SID,CID,h1,1,1,save,nullptr),"SEQUENCE_EXHAUSTED"));
 }
 '''
   with tempfile.TemporaryDirectory() as d:

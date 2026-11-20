@@ -1,5 +1,32 @@
 # 更新记录
 
+## MimiVent 固件 v0.7.1（2026-11-21）
+
+- 取消三槽多客户端授权（`kMaxBindings=3`），改为单服务授权：设备保存 `serviceId` / `credentialId` / `credentialHash` / `authRevision`，手机权限由 Gateway 管理。
+- 新增硬件派生 `deviceId`（`SHA256("mimivent-c3:" + 出厂 MAC)` 前 16 字节）：擦除配置、升级、重启后保持稳定，Gateway 据此关联历史。
+- BLE 新增 `wifi.service.status/begin/activate/cancel/confirm/clear/verify`；旧 `wifi.bind.*`、`wifi.revoke`、`wifi.clients` 明确返回 `SERVICE_RECONFIG_REQUIRED`，不再返回模糊失败。
+- MQTT 控制鉴权改用服务凭据；去重身份从 `tokenId` 改为 `serviceId + requestId`，凭据轮换不失去重保护。
+- MQTT 状态新增 `service` 字段（deviceId/serviceId/credentialId/authRevision/state）；`authTokens` 仅保留当前有效凭据摘要，兼容旧只读校验。
+- 候选事务有效期 5 分钟；重启后一律清除残留候选（断电无法判断是否过期，保留会阻塞新配置）；激活后候选标记为 activated，保留供核验但不阻塞新事务。
+- 单服务记录使用独立 NVS 键；保留旧授权数据以支持回滚，不将旧三槽记录误读为新服务授权。
+- Broker 新配置先作为候选连接；成功后确认切换，错误凭据或候选窗口内重启会恢复之前可用配置。
+- 最低 App 版本提高到 `0.7.1`，与单服务授权协议匹配；固件版本从上次正式版 `v0.7.0` 递增，忽略开发测试构建号。
+- 验证：固件测试 49 项通过；BLE 与 NAS 目标均构建通过（BLE 约 45% / NAS 约 87% Flash；静态 RAM 分别约 19% / 21%）；Broker 成功配置、错误凭据回退及候选窗口内重启恢复已在实机验证。
+- BLE/NAS 为本版正式构建目标；Remote 仍是未实现 TLS 的开发脚手架，不能用于公网远程控制。跨类型 OTA 属于后续阶段。
+
+## 开发阶段记录（版本号不作为发布基线）
+
+### P1 开发验证（原内部构建号 `0.7.1`）
+
+- 在正式 v0.7.0 上增量建立 BLE/NAS/Remote 编译目标与冲突校验；Remote 仅为显式实验脚手架，未实现远程 TLS，禁止作为远程版部署。
+- 状态、OTA 能力和已签名镜像加入构建类型；P1 只接受同类型 OTA，保留哈希固定的正式 NAS v0.7.0 回退包。
+- 冻结正式分区和 Preferences OTA 双检查点、分块/流控；构建后校验真实分区、目标及大小并输出 SHA-256 清单。
+- 修复完整 OTA 包暂停续传检查点的两个偏移错位：按同一 16 KiB 边界保存固件偏移与包偏移，避免续传末尾 PACKAGE_BLOCK；不改包格式、BLE 流控或 Preferences 存储。
+- 修复去重表满时提前淘汰保护期内终态记录的问题；无可回收槽时拒绝新请求，避免 ACK 丢失后同编号重试重复执行。
+- 修复主机测试替身缺少 reserve，并对齐正式 schema 8、记录尺寸和既有 1000ms 状态采样；不改变统计业务和网络采样参数。
+- 该开发构建号未作为正式版本发布；本次正式版 `v0.7.1` 以最后正式版 `v0.7.0` 为基线递增。
+
+
 ## [0.7.0] - 2026-11-13
 
 - 版本从主分支 `v0.6.0` 递增；该版本汇总开发期尚未进入主分支的 MQTT、存储和 OTA 改进。

@@ -18,6 +18,7 @@ class OtaStatusPublicationTest(unittest.TestCase):
 #include <cassert>
 #include <iostream>
 #define FIRMWARE_PARTITION_PROFILE "test-profile"
+#define MIMIVENT_TRANSPORT_NAME "nas"
 struct Partition { int address=0; int size=1024; } part;
 using esp_partition_t=Partition;
 struct esp_image_metadata_t { uint32_t image_len=1024; };

@@ -26,7 +26,10 @@
 namespace {
 constexpr char kNamespace[] = "mv-mqtt";
 constexpr char kConfigKey[] = "broker";
+// 新 Broker 先写入候选键，验证命令订阅成功后才替换 broker。
+constexpr char kCandidateConfigKey[] = "brk-cand";
 constexpr uint32_t kConfigMagic = 0x4D564D31;
+constexpr uint32_t kConfigTrialTimeoutMs = 12000;
 // state 负载约 563 字节，command/ack 也远小于 1 KB；收到更大消息按越界丢弃。
 // 单条消息上限。state 随字段增加已到 1015 B，加上 topic 与封装开销约 1076 B，
 // 原来的 1024 会把状态发布整条丢弃（串口 "state message exceeds 1024 bytes"），
@@ -83,6 +86,12 @@ struct BrokerConfig {
 
 BrokerConfig config{};
 bool configured = false;
+BrokerConfig fallbackConfig{};
+bool fallbackConfigured = false;
+bool configTrial = false;
+uint32_t configTrialStartedAt = 0;
+std::atomic<bool> configTrialConnected{false};
+const char* configState = "unconfigured";
 std::atomic<bool> connected{false};
 bool restartRequested = false;
 uint32_t lastPublishAt = 0;
@@ -133,19 +142,61 @@ uint32_t configChecksum(const BrokerConfig& value) {
                       offsetof(BrokerConfig, checksum));
 }
 
-bool readConfig() {
+bool validConfig(const BrokerConfig& value) {
+  return value.magic == kConfigMagic &&
+      value.checksum == configChecksum(value) && value.port != 0 &&
+      value.host[0] != '\0' && value.username[0] != '\0' &&
+      value.password[0] != '\0';
+}
+
+bool readConfigKey(const char* key, BrokerConfig& value) {
   if (!preferences.begin(kNamespace, true)) return false;
-  const size_t length = preferences.getBytesLength(kConfigKey);
-  BrokerConfig candidate{};
-  const size_t read = length == sizeof(candidate)
-      ? preferences.getBytes(kConfigKey, &candidate, sizeof(candidate)) : 0;
+  const size_t length = preferences.getBytesLength(key);
+  const size_t read = length == sizeof(value)
+      ? preferences.getBytes(key, &value, sizeof(value)) : 0;
   preferences.end();
-  if (read != sizeof(candidate) || candidate.magic != kConfigMagic ||
-      candidate.checksum != configChecksum(candidate) || candidate.port == 0 ||
-      candidate.host[0] == '\0' || candidate.username[0] == '\0' ||
-      candidate.password[0] == '\0') return false;
-  config = candidate;
-  return true;
+  return read == sizeof(value) && validConfig(value);
+}
+
+bool writeConfigKey(const char* key, const BrokerConfig& source) {
+  BrokerConfig value = source;
+  value.magic = kConfigMagic;
+  value.checksum = configChecksum(value);
+  if (!preferences.begin(kNamespace, false)) return false;
+  const size_t written = preferences.putBytes(key, &value, sizeof(value));
+  preferences.end();
+  if (written != sizeof(value)) return false;
+  BrokerConfig check{};
+  return readConfigKey(key, check) && memcmp(&check, &value, sizeof(value)) == 0;
+}
+
+bool removeConfigKey(const char* key) {
+  if (!preferences.begin(kNamespace, false)) return false;
+  const bool existed = preferences.isKey(key);
+  const bool ok = !existed || preferences.remove(key);
+  preferences.end();
+  return ok;
+}
+
+bool readConfig() {
+  BrokerConfig active{};
+  const bool hasActive = readConfigKey(kConfigKey, active);
+  // 上电时不自动采用未验证候选：有效 Broker 保持不变，首次配置中断则回到未配置态。
+  // 候选只在当前会话内试连，避免断电后把设备锁在错误的 Broker 上。
+  // 清理失败也不影响读取有效配置；启动时始终忽略候选键。
+  removeConfigKey(kCandidateConfigKey);
+  if (hasActive) {
+    config = active;
+    fallbackConfig = active;
+    fallbackConfigured = true;
+    configState = "active";
+    return true;
+  }
+  config = {};
+  fallbackConfig = {};
+  fallbackConfigured = false;
+  configState = "unconfigured";
+  return false;
 }
 
 bool validPrivateHost(const char* host) {
@@ -167,18 +218,48 @@ bool validText(const char* value, size_t minLength, size_t maxLength) {
   return true;
 }
 
-bool saveConfig(const BrokerConfig& source) {
+bool stageConfig(const BrokerConfig& source) {
   BrokerConfig value = source;
   value.magic = kConfigMagic;
   value.checksum = configChecksum(value);
-  if (!preferences.begin(kNamespace, false)) return false;
-  const size_t written = preferences.putBytes(kConfigKey, &value, sizeof(value));
-  preferences.end();
-  if (written != sizeof(value)) return false;
+  if (!writeConfigKey(kCandidateConfigKey, value)) return false;
+  if (!configTrial) {
+    fallbackConfig = config;
+    fallbackConfigured = configured;
+  }
   config = value;
   configured = true;
+  configTrial = true;
+  configTrialStartedAt = millis();
+  configTrialConnected.store(false);
+  configState = "trial";
   restartRequested = true;
   return true;
+}
+
+bool promoteStagedConfig() {
+  if (!configTrial || !validConfig(config)) return false;
+  // 先持久化有效值，再删候选；若断电发生在两步之间，启动时有效值优先。
+  if (!writeConfigKey(kConfigKey, config)) return false;
+  removeConfigKey(kCandidateConfigKey);
+  fallbackConfig = config;
+  fallbackConfigured = true;
+  configTrial = false;
+  configState = "active";
+  return true;
+}
+
+void rollbackStagedConfig() {
+  if (!configTrial) return;
+  removeConfigKey(kCandidateConfigKey);
+  config = fallbackConfig;
+  configured = fallbackConfigured;
+  configTrial = false;
+  configTrialConnected.store(false);
+  configState = "rolled_back";
+  restartRequested = true;
+  Serial.printf("[mqtt] broker config trial failed; restored previous=%d\n",
+                configured ? 1 : 0);
 }
 
 String errorJson(const char* error) {
@@ -810,6 +891,7 @@ void eventHandler(void*, esp_event_base_t, int32_t eventId, void* eventData) {
   } else if(eventId==MQTT_EVENT_SUBSCRIBED&&event->msg_id==commandSubscription) {
     if(event->data_len!=1||!event->data||static_cast<uint8_t>(event->data[0])!=1)return;
     commandSubscribed=true;
+    if (configTrial) configTrialConnected.store(true);
     if(!commandReady){commandReady=true;publishText(availabilityTopic,"online",1,true);}
     stateSnapshotRequested.store(true);
   } else if(eventId==MQTT_EVENT_SUBSCRIBED&&event->msg_id==querySubscription) {
@@ -906,7 +988,9 @@ void destroyClient() {
 bool startClient() {
   if (!configured || WiFi.status() != WL_CONNECTED || !wifiDeviceIdentityReady() ||
       !wifiBindingReady()) return false;
-  const char* device = wifiDeviceId();
+  // P2：MQTT 主题、clientId 与 state.service 统一使用硬件派生 deviceId。
+  // 旧 wifiDeviceId() 由 NVS 证书派生，擦除配置后会改变，导致 Gateway 关联断裂。
+  const char* device = wifiBindingDeviceId();
   snprintf(brokerUri, sizeof(brokerUri), "mqtt://%s:%u", config.host,
            static_cast<unsigned>(config.port));
   snprintf(clientId, sizeof(clientId), "mimivent-%s", device);
@@ -968,6 +1052,15 @@ void wifiMqttSuspendForOta() {
 }
 
 void wifiMqttUpdate() {
+  // Broker 试连超时必须在 WiFi/绑定/OTA 的早退判断之前处理；否则离线期间
+  // 试连状态不会收敛，直到网络恢复或设备重启才回退。
+  if (configTrial) {
+    if (configTrialConnected.exchange(false)) {
+      if (!promoteStagedConfig()) rollbackStagedConfig();
+    } else if (uint32_t(millis() - configTrialStartedAt) >= kConfigTrialTimeoutMs) {
+      rollbackStagedConfig();
+    }
+  }
   if (otaManagerIsActive() || WiFi.status() != WL_CONNECTED || !wifiBindingReady()) {
     // 这几个条件原本完全静默，串口看不出 MQTT 到底卡在哪一环。
     static uint32_t lastIdleLogMs = 0;
@@ -1037,7 +1130,7 @@ void wifiMqttUpdate() {
     return;
   }
   cJSON* envelope = cJSON_CreateObject();
-  const char* deviceId = wifiDeviceId();
+  const char* deviceId = wifiBindingDeviceId();
   const char* bootId = statisticsStoreBootId();
   const uint64_t sampledUptimeMs = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
   const bool metadataReady = envelope && deviceId && deviceId[0] && bootId && bootId[0] &&
@@ -1089,6 +1182,7 @@ String wifiMqttHandleRequest(cJSON* root, const char* owner) {
     if (!result) return errorJson("OUT_OF_MEMORY");
     cJSON_AddBoolToObject(result, "configured", configured);
     cJSON_AddBoolToObject(result, "connected", commandReady);
+    cJSON_AddStringToObject(result, "configurationState", configState);
     cJSON_AddNumberToObject(result,"outboxBytes",client?esp_mqtt_client_get_outbox_size(client):0);
     cJSON_AddNumberToObject(result,"queueRejected",queueRejected.load());
     cJSON_AddNumberToObject(result,"enqueueFailures",enqueueFailures.load());
@@ -1103,9 +1197,13 @@ String wifiMqttHandleRequest(cJSON* root, const char* owner) {
   if (!strcmp(op, "wifi.mqtt.clear")) {
     if (!wifiBindingOwnerAllowed(owner)) return errorJson("PERMISSION_DENIED");
     if (!preferences.begin(kNamespace, false)) return errorJson("STORAGE_UNAVAILABLE");
-    const bool ok = preferences.remove(kConfigKey);preferences.end();
+    const bool activeOk = !preferences.isKey(kConfigKey) || preferences.remove(kConfigKey);
+    const bool candidateOk = !preferences.isKey(kCandidateConfigKey) || preferences.remove(kCandidateConfigKey);
+    const bool ok = activeOk && candidateOk;
+    preferences.end();
     if (!ok) return errorJson("STORAGE_UNAVAILABLE");
-    configured = false;restartRequested = true;
+    configured = false;configTrial = false;fallbackConfigured = false;
+    config = {};fallbackConfig = {};configState = "unconfigured";restartRequested = true;
     return "{\"configured\":false}";
   }
   if (strcmp(op, "wifi.mqtt.configure") != 0) return errorJson("UNSUPPORTED_OPERATION");
@@ -1124,7 +1222,7 @@ String wifiMqttHandleRequest(cJSON* root, const char* owner) {
   strncpy(candidate.host, host, sizeof(candidate.host) - 1);
   strncpy(candidate.username, username, sizeof(candidate.username) - 1);
   strncpy(candidate.password, password, sizeof(candidate.password) - 1);
-  if (!saveConfig(candidate)) return errorJson("STORAGE_UNAVAILABLE");
+  if (!stageConfig(candidate)) return errorJson("STORAGE_UNAVAILABLE");
   return "{\"configured\":true,\"connected\":false}";
 }
 #endif

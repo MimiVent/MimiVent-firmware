@@ -39,7 +39,7 @@ class StatisticsRangeQueryTest(unittest.TestCase):
         error, data = self.rows['single']
         self.assertEqual(error, 0)
         self.assertEqual(data['apiVersion'], 2)
-        self.assertEqual(data['storageSchema'], 7)
+        self.assertEqual(data['storageSchema'], 8)
         self.assertEqual(data['statisticsSchema'], 4)
         self.assertEqual((data['dayCount'], data['bucketHours'], data['bucketCount']), (1, 1, 24))
         self.assertNotIn('days', data)

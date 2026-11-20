@@ -111,7 +111,7 @@ void addWifiStatus(cJSON* root) {
 #if MIMIVENT_WIFI_READ_CONTROL
   cJSON_AddBoolToObject(root,"mqttConfigured",wifiMqttConfigured());
   cJSON_AddBoolToObject(root,"mqttConnected",wifiMqttConnected());
-  cJSON_AddStringToObject(root,"deviceId",wifiDeviceId());
+  cJSON_AddStringToObject(root,"deviceId",wifiBindingDeviceId());
   cJSON_AddStringToObject(root,"identityState",wifiDeviceIdentityState());
   cJSON_AddStringToObject(root,"bindingsState",wifiBindingState());
 #endif
@@ -524,7 +524,8 @@ String wifiProvisioningHandleRequest(const String& request,const String& owner) 
     if(cJSON_IsString(v)&&(!strcmp(v->valuestring,"wifi.storage.legacyStatus")||!strcmp(v->valuestring,"wifi.storage.cleanupLegacy"))){
       String result=wifiLegacyStorageRequest(root,owner.c_str());cJSON_Delete(root);return result;
     }
-    if(cJSON_IsString(v)&&(strncmp(v->valuestring,"wifi.bind.",10)==0||!strcmp(v->valuestring,"wifi.clients")||!strcmp(v->valuestring,"wifi.revoke"))){
+    // P2：wifi.service.* 是单服务授权协议，必须与旧 wifi.bind.* 一起路由到授权层。
+    if(cJSON_IsString(v)&&(strncmp(v->valuestring,"wifi.service.",13)==0||strncmp(v->valuestring,"wifi.bind.",10)==0||!strcmp(v->valuestring,"wifi.clients")||!strcmp(v->valuestring,"wifi.revoke"))){
       String result=wifiBindingRequest(root,owner.c_str());cJSON_Delete(root);return result;
     }
     if(cJSON_IsString(v)&&strncmp(v->valuestring,"wifi.mqtt.",10)==0){
